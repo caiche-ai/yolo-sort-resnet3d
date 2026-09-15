@@ -303,6 +303,7 @@ def workflow(video_source, target_path, detect_model_path, action_model_path, de
         detector = YoloDetector(detect_model_path, device=device)
         act_model = ActionRecognition(action_model_path, device=device)
         tracker = Sort(max_age=40, iou_threshold=0.1) # max_age,允许目标消失的最大帧数
+        processing_started_at = time.perf_counter()
 
         bbox_buffers = collections.defaultdict(lambda: BBoxBuffer())
         last_action_id = {}
@@ -315,6 +316,14 @@ def workflow(video_source, target_path, detect_model_path, action_model_path, de
             actual_input_frames += 1  # 实时统计输入帧数
             res_by_frame.append([])
             frame_cache.append(frame0)
+
+            # Release the oldest annotated frame before appending would wrap
+            # around and overwrite it in the fixed-size circular buffer.
+            if frame_id0 > 30:
+                out_frame = output_buffer.pop()
+                if out_frame is not None:
+                    output_streamer.write(out_frame)
+
             output_buffer.append(frame_id0, copy.deepcopy(frame0))
             frame = copy.deepcopy(frame0)
             # list of detections, each detection is a numpy array, shape (N, 6), (x1, y1, x2, y2, score, class)
@@ -380,11 +389,6 @@ def workflow(video_source, target_path, detect_model_path, action_model_path, de
                         if ffid+i < len(res_by_frame):
                             res_by_frame[ffid+i].append((*[round(x, 3) for x in box], int(aid), int(tid)))
             
-            # 移除帧数限制，确保所有帧都能输出
-            if frame_id0 > 30:
-                out_frame = output_buffer.pop()
-                if out_frame is not None:
-                    output_streamer.write(out_frame)
             frame_id0 += 1
     
         # 确保所有剩余帧都被输出
@@ -393,16 +397,23 @@ def workflow(video_source, target_path, detect_model_path, action_model_path, de
                 output_streamer.write(out_frame)
     
         output_streamer.write(None)
+        output_streamer.terminate()
+        processing_seconds = time.perf_counter() - processing_started_at
+        processing_fps = actual_input_frames / processing_seconds if processing_seconds else 0.0
         
         logging.info(f"实际输入帧数: {actual_input_frames}")
         logging.info(f"输出帧数: {output_buffer.output_count}")
+        logging.info(f"端到端处理耗时: {processing_seconds:.3f} 秒")
+        logging.info(f"端到端处理速度: {processing_fps:.3f} FPS")
         
         return {
             "summary": dict(action_counter),
             "res_by_frame": res_by_frame,
             "fps": fps,
             "实际输入帧数":actual_input_frames,
-            "输出帧数":output_buffer.output_count
+            "输出帧数":output_buffer.output_count,
+            "处理耗时秒": processing_seconds,
+            "处理速度FPS": processing_fps
         }
     finally:
         # 确保流被正确关闭
@@ -429,11 +440,21 @@ if __name__ == "__main__":
     arg_parser.add_argument("--device", type=int, default=0, help="device id")
     arg_parser.add_argument("--result_path", type=str, help="result path, json file")
     arg_parser.add_argument("--excel_path", type=str, help="excel file path")
+    arg_parser.add_argument(
+        "--detect_model", type=Path,
+        default=ROOT / "resource/det_action_old.onnx",
+        help="ONNX or TensorRT engine used for worker detection",
+    )
+    arg_parser.add_argument(
+        "--action_model", type=Path,
+        default=ROOT / "resource/jit.end2end.pt",
+        help="TorchScript model used for action recognition",
+    )
     args = arg_parser.parse_args()
 
     # 模型权重路径
-    detect_model_path = ROOT / "resource/det_action_old.onnx"
-    action_model_path =  ROOT / "resource/jit.end2end.pt"
+    detect_model_path = args.detect_model
+    action_model_path = args.action_model
     # gpu
     device = args.device
 

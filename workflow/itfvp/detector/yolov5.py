@@ -33,13 +33,18 @@ class AverageTimeCostManager(object):
 
 class YoloDetector(object):
     def __init__(self, weights_path, device='cpu', calc_time_cost=False, batch_size=1, imgsz=640):
+        weights_path = Path(weights_path)
         self.device = device
         self.cuda = self.device != 'cpu'
         self.half = self.device != 'cpu'
-        if weights_path.suffix == ".onnx":
+        self.onnx = False
+        self.tensorrt = False
+        if weights_path.suffix.lower() == ".onnx":
             self._init_onnx(weights_path)
+        elif weights_path.suffix.lower() == ".engine":
+            self._init_tensorrt(weights_path)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported detector model: {weights_path}")
         self._transform = Compose([
             ToTensor(),
         ])
@@ -89,16 +94,110 @@ class YoloDetector(object):
         self.stride = int(metadata['stride'])
         self.output_names = [x.name for x in self.session.get_outputs()]
 
+    def _init_tensorrt(self, weights_path):
+        if not self.cuda:
+            raise ValueError("TensorRT engines require a CUDA device")
+
+        try:
+            import tensorrt as trt
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorRT Python bindings are unavailable. On Jetson with a Conda "
+                "environment, add /usr/lib/python3.8/dist-packages to PYTHONPATH."
+            ) from exc
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        with open(weights_path, "rb") as engine_file:
+            engine = runtime.deserialize_cuda_engine(engine_file.read())
+        if engine is None:
+            raise RuntimeError(f"Failed to deserialize TensorRT engine: {weights_path}")
+
+        context = engine.create_execution_context()
+        if context is None:
+            raise RuntimeError(f"Failed to create TensorRT context: {weights_path}")
+
+        input_indices = [
+            index for index in range(engine.num_bindings)
+            if engine.binding_is_input(index)
+        ]
+        output_indices = [
+            index for index in range(engine.num_bindings)
+            if not engine.binding_is_input(index)
+        ]
+        if len(input_indices) != 1:
+            raise RuntimeError(
+                f"Expected one TensorRT input, found {len(input_indices)}"
+            )
+
+        self.tensorrt = True
+        self.trt = trt
+        self.trt_logger = logger
+        self.trt_runtime = runtime
+        self.engine = engine
+        self.context = context
+        self.input_index = input_indices[0]
+        self.output_indices = output_indices
+        self.output_names = [engine.get_binding_name(i) for i in output_indices]
+        # Letterbox uses auto=False, so the exact stride does not affect padding.
+        self.stride = 32
+
 
 
     def _from_numpy(self, x):
         return torch.from_numpy(x).to(self.device) if isinstance(x, np.ndarray) else x
+
+    def _trt_to_torch_dtype(self, dtype):
+        mapping = {
+            self.trt.float32: torch.float32,
+            self.trt.float16: torch.float16,
+            self.trt.int8: torch.int8,
+            self.trt.int32: torch.int32,
+            self.trt.bool: torch.bool,
+        }
+        try:
+            return mapping[dtype]
+        except KeyError as exc:
+            raise TypeError(f"Unsupported TensorRT binding dtype: {dtype}") from exc
 
     def _forward(self, im):
         if self.onnx:  # ONNX Runtime
             if isinstance(im, torch.Tensor):
                 im = im.cpu().numpy()  # torch to numpy
             y = self.session.run(self.output_names, {self.session.get_inputs()[0].name: im})
+        elif self.tensorrt:
+            input_dtype = self._trt_to_torch_dtype(
+                self.engine.get_binding_dtype(self.input_index)
+            )
+            if not isinstance(im, torch.Tensor):
+                im = torch.as_tensor(np.asarray(im), device=self.device)
+            im = im.to(device=self.device, dtype=input_dtype).contiguous()
+
+            if not self.context.set_binding_shape(self.input_index, tuple(im.shape)):
+                raise RuntimeError(
+                    f"TensorRT engine rejected input shape {tuple(im.shape)}"
+                )
+
+            bindings = [0] * self.engine.num_bindings
+            bindings[self.input_index] = im.data_ptr()
+            outputs = []
+            for output_index in self.output_indices:
+                output_shape = tuple(self.context.get_binding_shape(output_index))
+                output_dtype = self._trt_to_torch_dtype(
+                    self.engine.get_binding_dtype(output_index)
+                )
+                output = torch.empty(
+                    output_shape, dtype=output_dtype, device=self.device
+                )
+                bindings[output_index] = output.data_ptr()
+                outputs.append(output)
+
+            stream = torch.cuda.current_stream(device=self.device)
+            if not self.context.execute_async_v2(
+                bindings=bindings, stream_handle=stream.cuda_stream
+            ):
+                raise RuntimeError("TensorRT inference execution failed")
+            y = outputs[0] if len(outputs) == 1 else outputs
         if isinstance(y, list):
             y = self._from_numpy(y[0]) if len(y) == 1 else [self._from_numpy(a) for a in y]
         else:

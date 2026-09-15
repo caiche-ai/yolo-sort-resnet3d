@@ -4,3 +4,9 @@ dataset/
 yolo/runs/
 *.avi
 *.mp4
+*.engine
+*.build.log
+*.benchmark.log
+*.times.json
+workflow/deepstream/*.so
+benchmark/deepstream/

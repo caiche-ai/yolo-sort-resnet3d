@@ -1,0 +1,47 @@
+--- a/sequence_image_process.cpp
++++ b/sequence_image_process.cpp
+@@ -37,11 +37,20 @@
+ namespace {
+ // generate key for SrcDestBufMap
+ SourceKey
+-getKey(uint64_t src_id, float x, float y, float width, float height)
++getKey(const NvDsPreProcessUnit& unit)
+ {
++    const uint64_t src_id = unit.frame_meta->source_id;
++    if (unit.obj_meta &&
++        unit.obj_meta->object_id != UNTRACKED_OBJECT_ID) {
++        return std::make_tuple(
++            src_id, static_cast<int64_t>(unit.obj_meta->object_id), 0);
++    }
++
++    const auto& roi = unit.roi_meta.roi;
+     constexpr int64_t kMaxX = 10000;
+     constexpr int64_t kMaxY = kMaxX * kMaxX;
+-    int64_t xy0 = int64_t(x) * kMaxX + int64_t(y) * kMaxY;
+-    int64_t xy1 = int64_t(x + width) * kMaxX + int64_t(y * height) * kMaxY;
++    int64_t xy0 = int64_t(roi.left) * kMaxX + int64_t(roi.top) * kMaxY;
++    int64_t xy1 = int64_t(roi.left + roi.width) * kMaxX +
++                  int64_t(roi.top * roi.height) * kMaxY;
+     return std::make_tuple(src_id, xy0, xy1);
+ }
+@@ -201,9 +210,7 @@
+ {
+     for (const auto& unit : rois) {
+         uint64_t source_id = unit.frame_meta->source_id;
+-        const auto& roi = unit.roi_meta.roi;
+-        SourceKey key =
+-            getKey(source_id, roi.left, roi.top, roi.width, roi.height);
++        SourceKey key = getKey(unit);
+         // if allocate area is found, then run again.
+         if (_src2dstMap.find(key) != _src2dstMap.end()) {
+             continue;
+@@ -222,8 +228,7 @@
+ BufferManager::locateRoiDst(const NvDsPreProcessUnit& unit, void*& dstPatch)
+ {
+     uint64_t source_id = unit.frame_meta->source_id;
+-    const auto& roi = unit.roi_meta.roi;
+-    SourceKey key = getKey(source_id, roi.left, roi.top, roi.width, roi.height);
++    SourceKey key = getKey(unit);
+     auto iter = _src2dstMap.find(key);
+     if (iter == _src2dstMap.end()) {
+         LOG_ERROR(

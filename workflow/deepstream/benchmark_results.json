@@ -1,0 +1,47 @@
+{
+  "test_date": "2026-08-27",
+  "scope": "decode-yolov5-nms-osd-encode",
+  "device": {
+    "name": "NVIDIA Jetson Orin NX Developer Kit",
+    "power_mode_watts": 15,
+    "jetpack": "5.1.1",
+    "l4t": "35.3.1",
+    "cuda": "11.4",
+    "tensorrt": "8.5.2",
+    "deepstream": "6.2.0"
+  },
+  "input": {
+    "codec": "h264",
+    "width": 2490,
+    "height": 1400,
+    "fps": 10,
+    "duration_seconds": 30.1,
+    "frames": 301
+  },
+  "model": "worker.640.yolov5n6.fp16.engine",
+  "deepstream": {
+    "cold_first_run": {
+      "total_seconds": 11.079378,
+      "total_fps": 27.168
+    },
+    "cached_rerun": {
+      "total_seconds": 8.156338,
+      "total_fps": 36.904
+    },
+    "steady_state_fps": 107.58,
+    "output_frames": 301,
+    "detections": 1422,
+    "output_width": 2496,
+    "output_height": 1400
+  },
+  "baselines": {
+    "onnxruntime_cuda_model_forward_fps": 37.33,
+    "tensorrt_model_forward_fps": 171.38,
+    "python_tensorrt_software_codec_total_fps": 14.60,
+    "python_tensorrt_nvidia_codec_total_fps": 15.21
+  },
+  "excluded_components": [
+    "SORT tracking",
+    "3D ResNet action recognition"
+  ]
+}

@@ -19,34 +19,87 @@ def read_video(video_path):
         yield frame
 
 class ActionRecognition(object):
-    def __init__(self, model_path, device):
+    def __init__(self, model_path, device, input_size=240):
         self.model = torch.jit.load(str(model_path), map_location="cpu")
         self.model.eval()
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        else:
+            device = torch.device(device)
         self.device = device
-        self.model.to(device)
+        self.input_size = input_size
+        self.model.to(self.device)
+        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        if self.dtype == torch.float16:
+            self.model.half()
+
+    def _resize_center_crop(self, frame: np.ndarray) -> np.ndarray:
+        height, width = frame.shape[:2]
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid action frame shape: {frame.shape}")
+
+        scale = self.input_size / min(height, width)
+        resized_width = max(self.input_size, round(width * scale))
+        resized_height = max(self.input_size, round(height * scale))
+        frame = cv2.resize(
+            frame,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        left = (resized_width - self.input_size) // 2
+        top = (resized_height - self.input_size) // 2
+        return np.ascontiguousarray(
+            frame[top:top + self.input_size, left:left + self.input_size]
+        )
     
     def detect(self, inputs: Union[List[np.ndarray], np.ndarray]):
         """
         Args:
             frames: list of np.ndarray, RGB, (0, 255)
         """
-        # model input: N, C, T, H, W 
-        if isinstance(inputs, list):
-            inputs = np.stack(inputs)
-        assert inputs.ndim == 4
-        inputs = torch.from_numpy(inputs)
-        if inputs.shape[-1] == 3: # (T, H, W, C)
-            inputs = inputs.permute(3, 0, 1, 2)
-        elif inputs.shape[1] == 3: # (T, C, H, W)
-            inputs = inputs.permute(1, 0, 2, 3)
-        inputs = inputs.float().to(self.device).unsqueeze(0)
+        return self.detect_batch([inputs])[0]
+
+    def detect_batch(
+        self,
+        clips: List[Union[List[np.ndarray], np.ndarray]],
+    ) -> List[dict]:
+        """Run multiple equally sized RGB clips in one model invocation."""
+        if not clips:
+            return []
+
+        batch = []
+        for clip in clips:
+            inputs = np.stack(
+                [self._resize_center_crop(frame) for frame in clip]
+            )
+            if inputs.ndim != 4:
+                raise ValueError(
+                    f"Expected a 4D action clip, got shape {inputs.shape}"
+                )
+            inputs = torch.from_numpy(inputs)
+            if inputs.shape[-1] == 3:  # (T, H, W, C)
+                inputs = inputs.permute(3, 0, 1, 2)
+            elif inputs.shape[1] == 3:  # (T, C, H, W)
+                inputs = inputs.permute(1, 0, 2, 3)
+            else:
+                raise ValueError(
+                    f"Unable to find RGB channel in action clip {inputs.shape}"
+                )
+            batch.append(inputs)
+
+        inputs = torch.stack(batch).to(
+            device=self.device,
+            dtype=self.dtype,
+        )
         with torch.no_grad():
-            res = self.model(inputs)[0]
-            act_id = torch.argmax(res, dim=-1).item()
-        return {
-            "act_id": act_id,
-            "logits": res,
-        }
+            results = self.model(inputs)
+        return [
+            {
+                "act_id": int(torch.argmax(result, dim=-1).item()),
+                "logits": result,
+            }
+            for result in results
+        ]
 
 if __name__ == "__main__":
 
